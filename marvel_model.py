@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.models as models
 
 
@@ -185,6 +186,172 @@ class MarvelModel(nn.Module):
         return logits
 
 
+class MarvelSSLAutoencoder(nn.Module):
+    """
+    SSL autoencoder variant using the same dual-branch encoder idea:
+      - MFCC branch: ResNet18
+      - Spectrogram branch: EfficientNet-B0
+
+    The fused latent embedding is decoded to reconstruct both modalities.
+    """
+
+    def __init__(
+        self,
+        shared_dim: int = 512,
+        pretrained: bool = True,
+    ) -> None:
+        super().__init__()
+
+        # ---------------------------------------------------------------------
+        # Spectrogram encoder branch (EfficientNet-B0)
+        # ---------------------------------------------------------------------
+        effnet_weights = (
+            models.EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
+        )
+        effnet = models.efficientnet_b0(weights=effnet_weights)
+        self.spec_preconv = nn.Conv2d(1, 3, kernel_size=3, padding=1, bias=False)
+        self.spec_preconv_bn = nn.BatchNorm2d(3)
+        self.spec_backbone = effnet.features
+        self.spec_pool = effnet.avgpool
+        spec_out_dim = effnet.classifier[1].in_features  # 1280
+
+        # ---------------------------------------------------------------------
+        # MFCC encoder branch (ResNet18)
+        # ---------------------------------------------------------------------
+        resnet_weights = (
+            models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+        )
+        resnet = models.resnet18(weights=resnet_weights)
+        resnet.conv1 = nn.Conv2d(
+            in_channels=1,
+            out_channels=resnet.conv1.out_channels,
+            kernel_size=resnet.conv1.kernel_size,
+            stride=resnet.conv1.stride,
+            padding=resnet.conv1.padding,
+            bias=False,
+        )
+        self.mfcc_backbone = nn.Sequential(
+            resnet.conv1,
+            resnet.bn1,
+            resnet.relu,
+            resnet.maxpool,
+            resnet.layer1,
+            resnet.layer2,
+            resnet.layer3,
+            resnet.layer4,
+        )
+        self.mfcc_pool = resnet.avgpool
+        mfcc_out_dim = resnet.fc.in_features  # 512
+
+        # ---------------------------------------------------------------------
+        # Shared latent projection
+        # ---------------------------------------------------------------------
+        fused_dim = spec_out_dim + mfcc_out_dim  # 1792
+        self.shared = nn.Sequential(
+            nn.Linear(fused_dim, shared_dim),
+            nn.BatchNorm1d(shared_dim),
+            nn.LeakyReLU(0.1),
+        )
+
+        # ---------------------------------------------------------------------
+        # Lightweight decoders from latent z to each modality
+        # ---------------------------------------------------------------------
+        self.mfcc_decoder_fc = nn.Linear(shared_dim, 64 * 16 * 16)
+        self.mfcc_decoder = nn.Sequential(
+            nn.ConvTranspose2d(64, 64, kernel_size=4, stride=2, padding=1),  # 32x32
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),  # 64x64
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=3, padding=1),
+        )
+
+        self.spec_decoder_fc = nn.Linear(shared_dim, 64 * 16 * 16)
+        self.spec_decoder = nn.Sequential(
+            nn.ConvTranspose2d(64, 64, kernel_size=4, stride=2, padding=1),  # 32x32
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),  # 64x64
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=3, padding=1),
+        )
+
+    def encode(self, x_mfcc: torch.Tensor, x_spec: torch.Tensor) -> torch.Tensor:
+        # MFCC branch
+        h_mfcc = self.mfcc_backbone(x_mfcc)
+        h_mfcc = self.mfcc_pool(h_mfcc)
+        h_mfcc = torch.flatten(h_mfcc, 1)
+
+        # Spectrogram branch
+        x_spec_3ch = self.spec_preconv(x_spec)
+        x_spec_3ch = self.spec_preconv_bn(x_spec_3ch)
+        h_spec = self.spec_backbone(x_spec_3ch)
+        h_spec = self.spec_pool(h_spec)
+        h_spec = torch.flatten(h_spec, 1)
+
+        # Fuse
+        h_fused = torch.cat([h_mfcc, h_spec], dim=1)
+        z = self.shared(h_fused)
+        return z
+
+    def decode(
+        self,
+        z: torch.Tensor,
+        mfcc_shape: torch.Size,
+        spec_shape: torch.Size,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # MFCC reconstruction
+        r_mfcc = self.mfcc_decoder_fc(z).view(z.size(0), 64, 16, 16)
+        r_mfcc = self.mfcc_decoder(r_mfcc)
+        r_mfcc = F.interpolate(
+            r_mfcc,
+            size=(mfcc_shape[-2], mfcc_shape[-1]),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        # Spectrogram reconstruction
+        r_spec = self.spec_decoder_fc(z).view(z.size(0), 64, 16, 16)
+        r_spec = self.spec_decoder(r_spec)
+        r_spec = F.interpolate(
+            r_spec,
+            size=(spec_shape[-2], spec_shape[-1]),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return r_mfcc, r_spec
+
+    def forward(
+        self,
+        x_mfcc: torch.Tensor,
+        x_spec: torch.Tensor,
+        return_embedding: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        z = self.encode(x_mfcc, x_spec)
+        recon_mfcc, recon_spec = self.decode(z, x_mfcc.shape, x_spec.shape)
+        if return_embedding:
+            return recon_mfcc, recon_spec, z
+        return recon_mfcc, recon_spec
+
+    @staticmethod
+    def reconstruction_loss(
+        x_mfcc: torch.Tensor,
+        x_spec: torch.Tensor,
+        recon_mfcc: torch.Tensor,
+        recon_spec: torch.Tensor,
+        mfcc_weight: float = 1.0,
+        spec_weight: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Weighted MSE reconstruction loss for SSL training.
+        """
+        loss_mfcc = F.mse_loss(recon_mfcc, x_mfcc)
+        loss_spec = F.mse_loss(recon_spec, x_spec)
+        return mfcc_weight * loss_mfcc + spec_weight * loss_spec
+
+
 def weighted_bce_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -232,4 +399,17 @@ if __name__ == "__main__":
         task_indices = torch.tensor([0, 1, 2, 3], dtype=torch.long)
         logits_per_sample = model(x_mfcc, x_spec, task_idx=task_indices)
         print("Per-sample logits shape:", logits_per_sample.shape)
+
+        # SSL autoencoder sanity check
+        ssl_model = MarvelSSLAutoencoder(pretrained=False)
+        recon_mfcc, recon_spec, z = ssl_model(x_mfcc, x_spec, return_embedding=True)
+        print("Recon MFCC shape:", recon_mfcc.shape)
+        print("Recon Spec shape:", recon_spec.shape)
+        print("Embedding shape:", z.shape)
+        print(
+            "Reconstruction loss:",
+            MarvelSSLAutoencoder.reconstruction_loss(
+                x_mfcc, x_spec, recon_mfcc, recon_spec
+            ).item(),
+        )
 
