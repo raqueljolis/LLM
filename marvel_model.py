@@ -352,6 +352,341 @@ class MarvelSSLAutoencoder(nn.Module):
         return mfcc_weight * loss_mfcc + spec_weight * loss_spec
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  Building blocks for Masked CNN Autoencoder
+# ═══════════════════════════════════════════════════════════════════
+
+
+class _ResBlock2d(nn.Module):
+    """Conv → BN → GELU → Conv → BN  +  residual skip."""
+
+    def __init__(self, ch: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(ch, ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(ch),
+            nn.GELU(),
+            nn.Conv2d(ch, ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(ch),
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(x + self.net(x))
+
+
+class _DownStage(nn.Module):
+    """Halve spatial dims: strided 4×4 conv → BN → GELU → ResBlock."""
+
+    def __init__(self, in_ch: int, out_ch: int) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.GELU(),
+            _ResBlock2d(out_ch),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class _UpStage(nn.Module):
+    """Double spatial dims with skip-connection fusion."""
+
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int) -> None:
+        super().__init__()
+        self.up = nn.Sequential(
+            nn.ConvTranspose2d(in_ch, out_ch, 4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.GELU(),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(out_ch + skip_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.GELU(),
+        )
+        self.res = _ResBlock2d(out_ch)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = self.up(x)
+        # Match spatial dims if rounding caused ±1 difference
+        if x.shape[2:] != skip.shape[2:]:
+            x = F.interpolate(
+                x, size=skip.shape[2:], mode="bilinear", align_corners=False
+            )
+        x = torch.cat([x, skip], dim=1)
+        return self.res(self.fuse(x))
+
+
+class _CNNEncoder(nn.Module):
+    """Stem + N down-stages → (bottleneck, [skip_0, …, skip_{N-1}])."""
+
+    def __init__(self, channels: list[int]) -> None:
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, channels[0], 7, padding=3, bias=False),
+            nn.BatchNorm2d(channels[0]),
+            nn.GELU(),
+            _ResBlock2d(channels[0]),
+        )
+        self.stages = nn.ModuleList(
+            _DownStage(channels[i], channels[i + 1])
+            for i in range(len(channels) - 1)
+        )
+
+    def forward(self, x: torch.Tensor):
+        skips = []
+        x = self.stem(x)
+        skips.append(x)
+        for stage in self.stages:
+            x = stage(x)
+            skips.append(x)
+        return x, skips[:-1]  # bottleneck, earlier skips
+
+
+class _CNNDecoder(nn.Module):
+    """N up-stages with skip connections → 1-channel reconstruction."""
+
+    def __init__(self, channels: list[int]) -> None:
+        """channels: [bottleneck_ch, …, stem_ch], e.g. [512, 256, 128, 64]."""
+        super().__init__()
+        self.stages = nn.ModuleList(
+            _UpStage(channels[i], channels[i + 1], channels[i + 1])
+            for i in range(len(channels) - 1)
+        )
+        self.head = nn.Conv2d(channels[-1], 1, 1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        skips: list[torch.Tensor],
+        target_hw: tuple[int, int],
+    ) -> torch.Tensor:
+        for i, stage in enumerate(self.stages):
+            x = stage(x, skips[i])
+        x = self.head(x)
+        if x.shape[2:] != target_hw:
+            x = F.interpolate(
+                x, size=target_hw, mode="bilinear", align_corners=False
+            )
+        return x
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Masked CNN Autoencoder (MAE / BERT-style)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class MarvelMaskedAutoencoder(nn.Module):
+    """
+    Dual-branch **masked** CNN autoencoder for MFCC + log-Mel spectrograms.
+
+    Training strategy (MAE / BERT-style):
+        1. Randomly mask rectangular patches of each input spectrogram.
+        2. Replace masked patches with a learnable mask token.
+        3. Encode the corrupted input through a lightweight CNN encoder.
+        4. Decode via a symmetric CNN decoder with U-Net skip connections.
+        5. Compute reconstruction loss **only on masked patches**,
+           forcing the encoder to learn contextual representations.
+
+    Architecture per branch::
+
+        Encoder:  Conv7 stem → [DownStage × 3] → bottleneck
+                  channels: 1 → 64 → 128 → 256 → 512
+        Decoder:  [UpStage × 3 with skip connections] → Conv1×1 head
+                  channels: 512 → 256 → 128 → 64 → 1
+        Shared:   GAP(bottleneck_mfcc) ‖ GAP(bottleneck_mel) → Linear → z
+
+    Key differences from ``MarvelSSLAutoencoder``:
+        - Random patch masking instead of additive noise
+        - Lightweight CNN blocks instead of pretrained ResNet-18 / EfficientNet-B0
+        - U-Net skip connections for much better spatial reconstruction
+        - Loss focused on masked regions (prevents trivial identity shortcut)
+    """
+
+    def __init__(
+        self,
+        shared_dim: int = 512,
+        channels: tuple[int, ...] = (64, 128, 256, 512),
+        patch_size: tuple[int, int] = (16, 16),
+        mask_ratio: float = 0.50,
+        pretrained: bool = True,  # ignored — kept for API compat
+    ) -> None:
+        super().__init__()
+        self.shared_dim = shared_dim
+        self.patch_size = patch_size
+        self.mask_ratio = mask_ratio
+
+        # Learnable mask tokens (one per branch)
+        self.mfcc_mask_token = nn.Parameter(torch.zeros(1, 1, 1, 1))
+        self.spec_mask_token = nn.Parameter(torch.zeros(1, 1, 1, 1))
+        nn.init.normal_(self.mfcc_mask_token, std=0.02)
+        nn.init.normal_(self.spec_mask_token, std=0.02)
+
+        # Branch encoders
+        ch_list = list(channels)
+        self.mfcc_encoder = _CNNEncoder(ch_list)
+        self.spec_encoder = _CNNEncoder(ch_list)
+
+        # Shared embedding: GAP(bottleneck_mfcc) ‖ GAP(bottleneck_mel) → z
+        self.shared = nn.Sequential(
+            nn.Linear(channels[-1] * 2, shared_dim),
+            nn.BatchNorm1d(shared_dim),
+            nn.GELU(),
+        )
+
+        # Branch decoders (mirror of encoders)
+        rev = list(reversed(channels))
+        self.mfcc_decoder = _CNNDecoder(rev)
+        self.spec_decoder = _CNNDecoder(rev)
+
+    # ── Patch masking ─────────────────────────────────────────────
+
+    def _make_patch_mask(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Random binary mask over non-overlapping patches.
+
+        Returns ``(B, 1, H, W)`` with **1 = masked**, 0 = visible.
+        """
+        B, _, H, W = x.shape
+        pH, pW = self.patch_size
+        nH, nW = H // pH, W // pW
+        n_patches = nH * nW
+        n_mask = max(1, int(n_patches * self.mask_ratio))
+
+        mask = torch.zeros(B, 1, nH, nW, device=x.device, dtype=x.dtype)
+        for b in range(B):
+            idx = torch.randperm(n_patches, device=x.device)[:n_mask]
+            mask[b, 0].view(-1)[idx] = 1.0
+
+        # Expand to pixel level
+        mask = mask.repeat_interleave(pH, dim=2).repeat_interleave(pW, dim=3)
+
+        # Pad if input not exactly divisible by patch_size
+        if mask.shape[2] < H or mask.shape[3] < W:
+            mask = F.pad(mask, (0, W - mask.shape[3], 0, H - mask.shape[2]))
+
+        return mask
+
+    @staticmethod
+    def _apply_mask(
+        x: torch.Tensor, mask: torch.Tensor, token: nn.Parameter
+    ) -> torch.Tensor:
+        """Replace masked pixels with the learnable mask token."""
+        return x * (1.0 - mask) + token.expand_as(x) * mask
+
+    # ── Encode (no masking — for inference / downstream) ──────────
+
+    def encode(
+        self, x_mfcc: torch.Tensor, x_spec: torch.Tensor
+    ) -> torch.Tensor:
+        """Return shared embedding *z* without masking."""
+        h_mfcc, _ = self.mfcc_encoder(x_mfcc)
+        h_spec, _ = self.spec_encoder(x_spec)
+        z = self.shared(
+            torch.cat(
+                [h_mfcc.mean(dim=(2, 3)), h_spec.mean(dim=(2, 3))], dim=1
+            )
+        )
+        return z
+
+    # ── Full forward ──────────────────────────────────────────────
+
+    def forward(
+        self,
+        x_mfcc: torch.Tensor,
+        x_spec: torch.Tensor,
+        return_embedding: bool = False,
+    ):
+        """
+        Forward pass with masking (train) or without (eval).
+
+        Returns
+        -------
+        ``return_embedding=False``:
+            ``(recon_mfcc, recon_spec, mask_mfcc, mask_spec)``
+        ``return_embedding=True``:
+            ``(recon_mfcc, recon_spec, z, mask_mfcc, mask_spec)``
+
+        Masks are ``(B, 1, H, W)`` binary tensors (1 = masked pixel).
+        During ``model.eval()`` no masking is applied; masks are all-ones.
+        """
+        # ── Masking ───────────────────────────────────────────────
+        if self.training:
+            mask_mfcc = self._make_patch_mask(x_mfcc)
+            mask_spec = self._make_patch_mask(x_spec)
+            x_mfcc_in = self._apply_mask(x_mfcc, mask_mfcc, self.mfcc_mask_token)
+            x_spec_in = self._apply_mask(x_spec, mask_spec, self.spec_mask_token)
+        else:
+            mask_mfcc = torch.ones(
+                x_mfcc.shape[0], 1, x_mfcc.shape[2], x_mfcc.shape[3],
+                device=x_mfcc.device, dtype=x_mfcc.dtype,
+            )
+            mask_spec = torch.ones(
+                x_spec.shape[0], 1, x_spec.shape[2], x_spec.shape[3],
+                device=x_spec.device, dtype=x_spec.dtype,
+            )
+            x_mfcc_in = x_mfcc
+            x_spec_in = x_spec
+
+        # ── Encode ────────────────────────────────────────────────
+        h_mfcc, skips_mfcc = self.mfcc_encoder(x_mfcc_in)
+        h_spec, skips_spec = self.spec_encoder(x_spec_in)
+
+        # ── Shared embedding ──────────────────────────────────────
+        z = self.shared(
+            torch.cat(
+                [h_mfcc.mean(dim=(2, 3)), h_spec.mean(dim=(2, 3))], dim=1
+            )
+        )
+
+        # ── Decode ────────────────────────────────────────────────
+        recon_mfcc = self.mfcc_decoder(
+            h_mfcc, skips_mfcc[::-1], target_hw=x_mfcc.shape[2:]
+        )
+        recon_spec = self.spec_decoder(
+            h_spec, skips_spec[::-1], target_hw=x_spec.shape[2:]
+        )
+
+        if return_embedding:
+            return recon_mfcc, recon_spec, z, mask_mfcc, mask_spec
+        return recon_mfcc, recon_spec, mask_mfcc, mask_spec
+
+    # ── Loss ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def reconstruction_loss(
+        x_mfcc: torch.Tensor,
+        x_spec: torch.Tensor,
+        recon_mfcc: torch.Tensor,
+        recon_spec: torch.Tensor,
+        mask_mfcc: torch.Tensor | None = None,
+        mask_spec: torch.Tensor | None = None,
+        mfcc_weight: float = 1.0,
+        spec_weight: float = 1.0,
+        visible_weight: float = 0.1,
+    ) -> torch.Tensor:
+        """
+        Masked reconstruction loss (MSE).
+
+        Masked pixels get weight 1.0; visible pixels get weight
+        ``visible_weight`` (default 0.1) — a small signal on visible
+        regions stabilises early training.
+        """
+
+        def _weighted_mse(orig, recon, mask):
+            if mask is None:
+                return F.mse_loss(recon, orig)
+            w = mask + (1.0 - mask) * visible_weight
+            return (w * (recon - orig) ** 2).mean()
+
+        return (
+            mfcc_weight * _weighted_mse(x_mfcc, recon_mfcc, mask_mfcc)
+            + spec_weight * _weighted_mse(x_spec, recon_spec, mask_spec)
+        )
+
+
 def weighted_bce_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -413,3 +748,26 @@ if __name__ == "__main__":
             ).item(),
         )
 
+    # Masked autoencoder sanity check
+    print("\n--- MarvelMaskedAutoencoder ---")
+    mae_model = MarvelMaskedAutoencoder(pretrained=False)
+    n_params = sum(p.numel() for p in mae_model.parameters())
+    print(f"Parameters: {n_params:,}")
+
+    mae_model.train()
+    recon_m, recon_s, mask_m, mask_s = mae_model(x_mfcc, x_spec)
+    print(f"[train] Recon MFCC: {recon_m.shape}  Mask: {mask_m.shape}")
+    print(f"[train] Recon Spec: {recon_s.shape}  Mask: {mask_s.shape}")
+    print(f"[train] Mask ratio MFCC: {mask_m.mean():.2f}  Spec: {mask_s.mean():.2f}")
+    loss = MarvelMaskedAutoencoder.reconstruction_loss(
+        x_mfcc, x_spec, recon_m, recon_s, mask_m, mask_s,
+    )
+    print(f"[train] Masked recon loss: {loss.item():.4f}")
+
+    mae_model.eval()
+    with torch.no_grad():
+        recon_m, recon_s, z, mask_m, mask_s = mae_model(
+            x_mfcc, x_spec, return_embedding=True
+        )
+    print(f"\n[eval]  Recon MFCC: {recon_m.shape}  Embedding: {z.shape}")
+    print(f"[eval]  Mask mean (should be 1.0): {mask_m.mean():.1f}")
